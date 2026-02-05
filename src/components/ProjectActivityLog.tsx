@@ -1,7 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { format } from "date-fns";
-import { History, User, FileCode, ArrowRight } from "lucide-react";
+import { History, User, FileCode, ArrowRight, Download } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import {
   Table,
   TableBody,
@@ -15,12 +16,15 @@ interface ActivityLogEntry {
   id: string;
   asset_id: string;
   asset_name: string;
+  asset_path: string;
   old_status: "pending" | "received" | "implemented";
   new_status: "pending" | "received" | "implemented";
   changed_by: string;
   changed_by_email: string | null;
   changed_by_nickname: string | null;
   created_at: string;
+  change_sequence: number;
+  comment?: string | null;
 }
 
 interface ProjectActivityLogProps {
@@ -34,7 +38,7 @@ export const ProjectActivityLog = ({ projectId }: ProjectActivityLogProps) => {
       // Fetch asset_history for all assets in this project
       const { data: assets, error: assetsError } = await supabase
         .from("assets")
-        .select("id, name")
+        .select("id, name, file_path")
         .eq("project_id", projectId);
 
       if (assetsError) {
@@ -48,6 +52,7 @@ export const ProjectActivityLog = ({ projectId }: ProjectActivityLogProps) => {
 
       const assetIds = assets.map(a => a.id);
       const assetNameMap = new Map(assets.map(a => [a.id, a.name]));
+      const assetPathMap = new Map(assets.map(a => [a.id, a.file_path]));
 
       // Fetch history for all assets in this project
       const { data: history, error: historyError } = await supabase
@@ -55,42 +60,109 @@ export const ProjectActivityLog = ({ projectId }: ProjectActivityLogProps) => {
         .select("*")
         .in("asset_id", assetIds)
         .order("created_at", { ascending: false })
-        .limit(100); // Limit to last 100 entries
+        .limit(500); // keep generous history for export
 
       if (historyError) {
         console.error("Error fetching history:", historyError);
         throw historyError;
       }
 
-      // Enrich history with asset names and user details
-      const enrichedLogs: ActivityLogEntry[] = [];
+      const historyEntries = history || [];
+      const userIds = Array.from(new Set(historyEntries.map((h: any) => h.changed_by)));
 
-      for (const entry of history || []) {
-        // Get user profile for changed_by
-        const { data: profile } = await (supabase as any)
+      let profiles: Record<string, { email: string | null; nickname: string | null }> = {};
+      if (userIds.length > 0) {
+        const { data: profileRows, error: profileError } = await supabase
           .from("profiles")
-          .select("email, nickname")
-          .eq("id", entry.changed_by)
-          .single();
+          .select("id, email, nickname")
+          .in("id", userIds);
 
-        enrichedLogs.push({
+        if (profileError) {
+          console.error("Error fetching profiles for activity log:", profileError);
+        } else {
+          profiles = (profileRows || []).reduce((acc: any, row: any) => {
+            acc[row.id] = { email: row.email, nickname: row.nickname };
+            return acc;
+          }, {});
+        }
+      }
+
+      // Assign sequence per asset (ascending time = earlier cycle number)
+      const byAsset = new Map<string, any[]>();
+      for (const entry of historyEntries) {
+        if (!byAsset.has(entry.asset_id)) byAsset.set(entry.asset_id, []);
+        byAsset.get(entry.asset_id)!.push(entry);
+      }
+      byAsset.forEach((list) => list.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()));
+
+      const enrichedLogs: ActivityLogEntry[] = historyEntries.map((entry) => {
+        const prof = profiles[entry.changed_by] || {};
+        const sequence = (byAsset.get(entry.asset_id)?.findIndex((e) => e.id === entry.id) ?? 0) + 1;
+
+        return {
           id: entry.id,
           asset_id: entry.asset_id,
           asset_name: assetNameMap.get(entry.asset_id) || "Unknown Asset",
+          asset_path: assetPathMap.get(entry.asset_id) || "",
           old_status: entry.old_status,
           new_status: entry.new_status,
           changed_by: entry.changed_by,
-          changed_by_email: profile?.email || null,
-          changed_by_nickname: profile?.nickname || null,
+          changed_by_email: prof.email || null,
+          changed_by_nickname: prof.nickname || null,
           created_at: entry.created_at,
-        });
-      }
+          change_sequence: sequence,
+          comment: (entry as any).comment ?? null,
+        };
+      });
 
       return enrichedLogs;
     },
     enabled: !!projectId,
     staleTime: 60000, // Cache for 1 minute
   });
+
+  const handleExportCsv = () => {
+    if (!logs || logs.length === 0) return;
+
+    const headers = [
+      "timestamp",
+      "asset",
+      "file_path",
+      "old_status",
+      "new_status",
+      "change_sequence",
+      "changed_by",
+      "comment",
+    ];
+
+    const escape = (val: string | null | undefined) => {
+      const v = val ?? "";
+      return '"' + String(v).replace(/"/g, '""') + '"';
+    };
+
+    const rows = logs
+      .slice() // copy
+      .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+      .map((row) => [
+        format(new Date(row.created_at), "yyyy-MM-dd HH:mm:ss"),
+        row.asset_name,
+        row.asset_path,
+        row.old_status,
+        row.new_status,
+        row.change_sequence,
+        row.changed_by_email || row.changed_by_nickname || row.changed_by,
+        row.comment || "",
+      ].map(escape).join(","));
+
+    const csv = [headers.join(","), ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `project-${projectId}-timeline.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
 
   const getStatusColorClass = (status: string) => {
     switch (status) {
@@ -160,6 +232,17 @@ export const ProjectActivityLog = ({ projectId }: ProjectActivityLogProps) => {
         <span className="text-sm text-muted-foreground">
           ({logs.length} {logs.length === 1 ? "event" : "events"})
         </span>
+        <div className="ml-auto">
+          <Button
+            size="sm"
+            variant="outline"
+            className="border-border"
+            onClick={handleExportCsv}
+          >
+            <Download className="w-4 h-4 mr-2" />
+            Export CSV
+          </Button>
+        </div>
       </div>
 
       {/* Activity Table */}
@@ -177,7 +260,16 @@ export const ProjectActivityLog = ({ projectId }: ProjectActivityLogProps) => {
                 ASSET
               </TableHead>
               <TableHead className="text-muted-foreground font-display text-xs tracking-wider">
+                FILE PATH
+              </TableHead>
+              <TableHead className="text-muted-foreground font-display text-xs tracking-wider">
                 STATUS CHANGE
+              </TableHead>
+              <TableHead className="text-muted-foreground font-display text-xs tracking-wider">
+                COMMENT
+              </TableHead>
+              <TableHead className="text-muted-foreground font-display text-xs tracking-wider">
+                CHANGE #
               </TableHead>
             </TableRow>
           </TableHeader>
@@ -210,6 +302,11 @@ export const ProjectActivityLog = ({ projectId }: ProjectActivityLogProps) => {
                   </div>
                 </TableCell>
 
+                {/* File Path */}
+                <TableCell className="text-xs font-mono text-muted-foreground">
+                  {log.asset_path || "-"}
+                </TableCell>
+
                 {/* Status Change */}
                 <TableCell>
                   <div className="flex items-center gap-2">
@@ -222,6 +319,16 @@ export const ProjectActivityLog = ({ projectId }: ProjectActivityLogProps) => {
                     </span>
                     {getStatusChangeIndicator(log.old_status, log.new_status)}
                   </div>
+                </TableCell>
+
+                {/* Comment */}
+                <TableCell className="text-xs text-muted-foreground">
+                  {log.comment || "-"}
+                </TableCell>
+
+                {/* Change number per asset */}
+                <TableCell className="font-mono text-xs text-muted-foreground">
+                  {log.change_sequence}
                 </TableCell>
               </TableRow>
             ))}

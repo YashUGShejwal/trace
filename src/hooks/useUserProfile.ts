@@ -6,6 +6,8 @@ export interface UserProfile {
   email: string | null;
   nickname: string | null;
   avatar_url: string | null;
+  role?: "super_admin" | "product_owner" | "user";
+  is_blacklisted?: boolean;
   created_at: string;
 }
 
@@ -20,7 +22,7 @@ export function useUserProfile(userId: string | null) {
 
       const { data, error } = await supabase
         .from("profiles")
-        .select("*")
+        .select("id, email, nickname, avatar_url, role, is_blacklisted, created_at")
         .eq("id", userId)
         .single();
 

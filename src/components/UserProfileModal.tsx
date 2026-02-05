@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { useUserProfile, useUpdateProfile } from "@/hooks/useUserProfile";
+import { friendlyError } from "@/lib/utils";
 
 interface UserProfileModalProps {
   isOpen: boolean;
@@ -70,7 +71,7 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
     } catch (error: any) {
       toast({
         title: "Update Failed",
-        description: error.message || "Failed to update profile",
+        description: friendlyError(error.message) || "Failed to update profile",
         variant: "destructive",
       });
     }

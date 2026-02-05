@@ -1,5 +1,5 @@
 import React from "react";
-import { History, ArrowRight } from "lucide-react";
+import { History, ArrowRight, MessageSquare } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Popover,
@@ -109,6 +109,14 @@ export const AssetHistoryPopover: React.FC<AssetHistoryPopoverProps> = ({ assetI
                     <div className="text-xs text-muted-foreground">
                       by {entry.user_nickname || entry.user_email || "Unknown User"}
                     </div>
+
+                    {/* Comment */}
+                    {entry.comment && (
+                      <div className="mt-1 flex items-start gap-2 text-xs text-muted-foreground">
+                        <MessageSquare className="w-3 h-3 text-primary mt-0.5" />
+                        <span>{entry.comment}</span>
+                      </div>
+                    )}
                   </div>
                 );
               })}

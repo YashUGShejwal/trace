@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
+import { friendlyError } from "@/lib/utils";
 import { Terminal, Shield, AlertTriangle } from "lucide-react";
 import { z } from "zod";
 
@@ -73,7 +74,7 @@ const Auth = () => {
         if (error) {
           toast({
             title: "Authentication Failed",
-            description: error.message,
+            description: friendlyError(error.message),
             variant: "destructive",
           });
         } else {
@@ -101,7 +102,7 @@ const Auth = () => {
           } else {
             toast({
               title: "Registration Failed",
-              description: error.message,
+              description: friendlyError(error.message),
               variant: "destructive",
             });
           }

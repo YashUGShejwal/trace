@@ -10,6 +10,7 @@ export interface AssetHistoryEntry {
   user_email?: string;
   user_nickname?: string | null;
   changed_by: string;
+  comment?: string | null;
 }
 
 /**
@@ -59,6 +60,7 @@ export function useAssetHistory(assetId: string | null) {
           ...entry,
           user_email: undefined,
           user_nickname: undefined,
+          comment: (entry as any).comment ?? null,
         };
 
         // If the changed_by matches current user, add their email and nickname

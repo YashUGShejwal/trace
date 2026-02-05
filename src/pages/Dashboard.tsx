@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { User } from "@supabase/supabase-js";
 import { useToast } from "@/hooks/use-toast";
+import { friendlyError } from "@/lib/utils";
 import { ProjectHealthBar } from "@/components/ProjectHealthBar";
 import { ImportStructure } from "@/components/ImportStructure";
 import { AssetTable } from "@/components/AssetTable";
@@ -13,10 +14,10 @@ import { UserProfileModal } from "@/components/UserProfileModal";
 import { ProjectSettingsModal } from "@/components/ProjectSettingsModal";
 import { ProjectActivityLog } from "@/components/ProjectActivityLog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Terminal, LogOut, Plus, Folder, UserCircle, Settings } from "lucide-react";
+import { Terminal, LogOut, Plus, Folder, UserCircle, Settings, Shield } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Dialog,
   DialogContent,
@@ -24,6 +25,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import { useUserProfile } from "@/hooks/useUserProfile";
 
 interface Project {
   id: string;
@@ -49,6 +51,14 @@ interface Asset {
   updated_at: string;
 }
 
+interface ProfileOption {
+  id: string;
+  email: string | null;
+  nickname: string | null;
+}
+
+type ProjectMemberRole = "member" | "project_owner" | "none";
+
 const Dashboard = () => {
   const [user, setUser] = useState<User | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -57,11 +67,17 @@ const Dashboard = () => {
   const [loading, setLoading] = useState(true);
   const [newProjectName, setNewProjectName] = useState("");
   const [inviteEmails, setInviteEmails] = useState("");
+  const [allUsers, setAllUsers] = useState<ProfileOption[]>([]);
+  const [selectedUsers, setSelectedUsers] = useState<string[]>([]);
+  const [userSearch, setUserSearch] = useState("");
+  const [loadingUsers, setLoadingUsers] = useState(false);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [profileModalOpen, setProfileModalOpen] = useState(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+  const [projectRole, setProjectRole] = useState<ProjectMemberRole>("none");
   const navigate = useNavigate();
   const { toast } = useToast();
+  const { data: profile } = useUserProfile(user?.id || null);
 
   useEffect(() => {
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
@@ -83,6 +99,15 @@ const Dashboard = () => {
     return () => subscription.unsubscribe();
   }, [navigate]);
 
+  useEffect(() => {
+    if (createDialogOpen) {
+      fetchAllUsers();
+    } else {
+      setSelectedUsers([]);
+      setUserSearch("");
+    }
+  }, [createDialogOpen]);
+
   const fetchProjects = async () => {
     const { data, error } = await supabase
       .from("projects")
@@ -92,7 +117,7 @@ const Dashboard = () => {
     if (error) {
       toast({
         title: "Error fetching projects",
-        description: error.message,
+        description: friendlyError(error.message),
         variant: "destructive",
       });
     } else {
@@ -114,7 +139,7 @@ const Dashboard = () => {
     if (error) {
       toast({
         title: "Error fetching assets",
-        description: error.message,
+        description: friendlyError(error.message),
         variant: "destructive",
       });
     } else {
@@ -122,15 +147,66 @@ const Dashboard = () => {
     }
   };
 
+  const fetchAllUsers = async () => {
+    setLoadingUsers(true);
+
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, email, nickname")
+      .order("email", { ascending: true });
+
+    if (error) {
+      toast({
+        title: "Error loading users",
+        description: friendlyError(error.message),
+        variant: "destructive",
+      });
+    } else {
+      setAllUsers((data as ProfileOption[]) || []);
+    }
+
+    setLoadingUsers(false);
+  };
+
   useEffect(() => {
     if (selectedProject) {
       fetchAssets(selectedProject.id);
+      fetchProjectRole(selectedProject.id);
     }
   }, [selectedProject]);
 
   const handleSignOut = async () => {
     await supabase.auth.signOut();
     navigate("/auth");
+  };
+
+  const fetchProjectRole = async (projectId: string) => {
+    if (!user) return;
+
+    if (selectedProject && selectedProject.user_id === user.id) {
+      setProjectRole("project_owner");
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("project_members")
+      .select("role")
+      .eq("project_id", projectId)
+      .eq("user_id", user.id)
+      .single();
+
+    if (error || !data) {
+      setProjectRole("none");
+      return;
+    }
+
+    setProjectRole((data.role as ProjectMemberRole) || "member");
+  };
+
+  const toggleUserSelection = (userId: string) => {
+    setSelectedUsers((prev) =>
+      prev.includes(userId) ? prev.filter((id) => id !== userId) : [...prev, userId]
+    );
   };
 
   const createProject = async () => {
@@ -146,14 +222,13 @@ const Dashboard = () => {
     if (error) {
       toast({
         title: "Error creating project",
-        description: error.message,
+        description: friendlyError(error.message),
         variant: "destructive",
       });
       return;
     }
 
-    // Process member invites if any
-    let invitedCount = 0;
+    const memberIdsToAdd = new Set<string>(selectedUsers);
     const invalidEmails: string[] = [];
 
     if (inviteEmails.trim()) {
@@ -186,27 +261,44 @@ const Dashboard = () => {
           .single();
 
         if (profile) {
-          // Add to project_members
-          const { error: memberError } = await supabase
-            .from("project_members")
-            .insert({
-              project_id: data.id,
-              user_id: profile.id,
-            });
-
-          if (!memberError) {
-            invitedCount++;
-          }
+          memberIdsToAdd.add(profile.id);
         } else {
           invalidEmails.push(email);
         }
       }
     }
 
+    let addedMembers = 0;
+
+    // Always add creator as project_owner role row
+    memberIdsToAdd.add(user.id);
+
+    if (memberIdsToAdd.size > 0) {
+      const memberRows = Array.from(memberIdsToAdd).map((uid) => ({
+        project_id: data.id,
+        user_id: uid,
+        role: uid === user.id ? "project_owner" : "member",
+      }));
+
+      const { error: memberInsertError } = await supabase
+        .from("project_members")
+        .insert(memberRows);
+
+      if (memberInsertError) {
+        toast({
+          title: "Error adding members",
+          description: friendlyError(memberInsertError.message),
+          variant: "destructive",
+        });
+      } else {
+        addedMembers = memberRows.length;
+      }
+    }
+
     // Show success toast with invite results
     let description = `${newProjectName} has been created.`;
-    if (invitedCount > 0) {
-      description += ` ${invitedCount} member${invitedCount > 1 ? 's' : ''} invited.`;
+    if (addedMembers > 0) {
+      description += ` ${addedMembers} member${addedMembers > 1 ? "s" : ""} added.`;
     }
     if (invalidEmails.length > 0) {
       toast({
@@ -223,8 +315,11 @@ const Dashboard = () => {
 
     setProjects([data, ...projects]);
     setSelectedProject(data);
+    setProjectRole("project_owner");
     setNewProjectName("");
     setInviteEmails("");
+    setSelectedUsers([]);
+    setUserSearch("");
     setCreateDialogOpen(false);
   };
 
@@ -235,7 +330,7 @@ const Dashboard = () => {
       // Extract folder from path (everything before the last /)
       const lastSlashIndex = path.lastIndexOf("/");
       const folder = lastSlashIndex > 0 ? path.substring(0, lastSlashIndex) : null;
-      
+
       return {
         project_id: selectedProject.id,
         name: path.split("/").pop() || path,
@@ -250,7 +345,7 @@ const Dashboard = () => {
     if (error) {
       toast({
         title: "Import Failed",
-        description: error.message,
+        description: friendlyError(error.message),
         variant: "destructive",
       });
     } else {
@@ -280,10 +375,10 @@ const Dashboard = () => {
 
     // Check for backward transitions and increment revision_count
     // Note: The database trigger will also handle this, but we update local state
-    const isBackwardTransition = 
+    const isBackwardTransition =
       (currentAsset.status === "implemented" && (newStatus === "received" || newStatus === "pending")) ||
       (currentAsset.status === "received" && newStatus === "pending");
-    
+
     if (isBackwardTransition) {
       updates.revision_count = currentAsset.revision_count + 1;
     }
@@ -296,7 +391,7 @@ const Dashboard = () => {
     if (error) {
       toast({
         title: "Update Failed",
-        description: error.message,
+        description: friendlyError(error.message),
         variant: "destructive",
       });
     } else {
@@ -316,23 +411,23 @@ const Dashboard = () => {
     if (error) {
       toast({
         title: "Update Failed",
-        description: error.message,
+        description: friendlyError(error.message),
         variant: "destructive",
       });
     } else {
       // Use functional setState to ensure we're working with latest state
       setAssets((prevAssets) =>
         prevAssets.map((asset) =>
-          asset.id === assetId 
-            ? { ...asset, assigned_to: assignedTo || null, updated_at: new Date().toISOString() } 
+          asset.id === assetId
+            ? { ...asset, assigned_to: assignedTo || null, updated_at: new Date().toISOString() }
             : asset
         )
       );
-      
+
       toast({
         title: "Assignment Updated",
-        description: assignedTo 
-          ? `Task assigned to ${assignedTo}` 
+        description: assignedTo
+          ? `Task assigned to ${assignedTo}`
           : "Task unassigned",
       });
     }
@@ -347,13 +442,13 @@ const Dashboard = () => {
     if (error) {
       toast({
         title: "Delete Failed",
-        description: error.message,
+        description: friendlyError(error.message),
         variant: "destructive",
       });
     } else {
       // Use functional setState to ensure we're working with latest state
       setAssets((prevAssets) => prevAssets.filter((asset) => asset.id !== assetId));
-      
+
       toast({
         title: "Asset Deleted",
         description: "The asset has been removed from tracking.",
@@ -383,7 +478,7 @@ const Dashboard = () => {
     if (error) {
       toast({
         title: "Bulk Update Failed",
-        description: error.message,
+        description: friendlyError(error.message),
         variant: "destructive",
       });
     } else {
@@ -400,6 +495,30 @@ const Dashboard = () => {
   const healthPercentage = assets.length > 0 ? (implementedCount / assets.length) * 100 : 0;
   const isHighRisk = healthPercentage < 50 && assets.length > 0;
 
+  const filteredUsers = allUsers
+    .filter((u) => u.email)
+    .filter((u) => u.id !== user?.id)
+    .filter((u) => {
+      if (!userSearch.trim()) return true;
+      const q = userSearch.toLowerCase();
+      return (
+        (u.email || "").toLowerCase().includes(q) ||
+        (u.nickname || "").toLowerCase().includes(q)
+      );
+    });
+
+  const canManageProject = Boolean(
+    selectedProject &&
+    user &&
+    (
+      selectedProject.user_id === user.id ||
+      projectRole === "project_owner" ||
+      profile?.role === "super_admin"
+    )
+  );
+
+  const canCreateProject = profile?.role === "product_owner" || profile?.role === "super_admin";
+
   if (loading) {
     return (
       <div className="min-h-screen bg-background flex items-center justify-center">
@@ -413,7 +532,7 @@ const Dashboard = () => {
   return (
     <div className="min-h-screen bg-background grid-pattern relative">
       <div className="absolute inset-0 scanlines pointer-events-none" />
-      
+
       {/* Top Bar */}
       <header className="border-b border-border bg-card/80 backdrop-blur-sm sticky top-0 z-50">
         <div className="container mx-auto px-4 py-4">
@@ -440,6 +559,17 @@ const Dashboard = () => {
               >
                 <UserCircle className="w-5 h-5" />
               </Button>
+              {profile?.role === "super_admin" && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => navigate("/admin-dashboard")}
+                  className="text-primary hover:text-primary/80"
+                  title="Admin Dashboard"
+                >
+                  <Shield className="w-4 h-4" />
+                </Button>
+              )}
               <Button
                 variant="outline"
                 size="sm"
@@ -464,9 +594,9 @@ const Dashboard = () => {
               selectedProject={selectedProject}
               onSelect={setSelectedProject}
             />
-            
-            {/* Settings Icon (Owner Only) */}
-            {selectedProject && user && selectedProject.user_id === user.id && (
+
+            {/* Settings always for project-level admin; new project only for global creator roles */}
+            {canManageProject && (
               <Button
                 variant="ghost"
                 size="sm"
@@ -477,55 +607,108 @@ const Dashboard = () => {
                 <Settings className="w-4 h-4" />
               </Button>
             )}
-            
-            <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
-              <DialogTrigger asChild>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="border-primary text-primary hover:bg-primary hover:text-primary-foreground"
-                >
-                  <Plus className="w-4 h-4 mr-2" />
-                  NEW PROJECT
-                </Button>
-              </DialogTrigger>
-              <DialogContent className="bg-card border-border">
-                <DialogHeader>
-                  <DialogTitle className="font-display tracking-wider text-foreground">
-                    Initialize New Project
-                  </DialogTitle>
-                </DialogHeader>
-                <div className="space-y-4 pt-4">
-                  <div className="space-y-2">
-                    <Input
-                      value={newProjectName}
-                      onChange={(e) => setNewProjectName(e.target.value)}
-                      placeholder="Project codename..."
-                      className="bg-input border-border"
-                      onKeyDown={(e) => e.key === "Enter" && !inviteEmails && createProject()}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Textarea
-                      value={inviteEmails}
-                      onChange={(e) => setInviteEmails(e.target.value)}
-                      placeholder="Invite team members (comma-separated emails)&#10;Example: alice@team.com, bob@team.com"
-                      className="bg-input border-border min-h-[80px]"
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      Optional: Invite members who already have accounts
-                    </p>
-                  </div>
+
+            {canCreateProject && (
+              <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
+                <DialogTrigger asChild>
                   <Button
-                    onClick={createProject}
-                    className="w-full bg-primary text-primary-foreground hover:bg-primary/90"
+                    variant="outline"
+                    size="sm"
+                    className="border-primary text-primary hover:bg-primary hover:text-primary-foreground"
                   >
-                    CREATE PROJECT
+                    <Plus className="w-4 h-4 mr-2" />
+                    NEW PROJECT
                   </Button>
-                </div>
-              </DialogContent>
-            </Dialog>
+                </DialogTrigger>
+                <DialogContent className="bg-card border-border">
+                  <DialogHeader>
+                    <DialogTitle className="font-display tracking-wider text-foreground">
+                      Initialize New Project
+                    </DialogTitle>
+                  </DialogHeader>
+                  <div className="space-y-4 pt-4">
+                    <div className="space-y-2">
+                      <Input
+                        value={newProjectName}
+                        onChange={(e) => setNewProjectName(e.target.value)}
+                        placeholder="Project codename..."
+                        className="bg-input border-border"
+                        onKeyDown={(e) => e.key === "Enter" && createProject()}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Input
+                        value={userSearch}
+                        onChange={(e) => setUserSearch(e.target.value)}
+                        placeholder="Search existing users by email or name"
+                        className="bg-input border-border"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Add existing members now. You're automatically set as the owner.
+                      </p>
+                    </div>
+                    <div className="mt-2 border border-border rounded-sm">
+                      <ScrollArea className="h-48">
+                        {loadingUsers ? (
+                          <div className="text-center py-4 text-muted-foreground text-sm">
+                            Loading users...
+                          </div>
+                        ) : filteredUsers.length === 0 ? (
+                          <div className="text-center py-4 text-muted-foreground text-sm">
+                            No users found
+                          </div>
+                        ) : (
+                          <div className="divide-y divide-border">
+                            {filteredUsers.map((profile) => {
+                              const isSelected = selectedUsers.includes(profile.id);
+                              return (
+                                <button
+                                  key={profile.id}
+                                  type="button"
+                                  onClick={() => toggleUserSelection(profile.id)}
+                                  className={`w-full text-left px-3 py-2 flex items-center justify-between hover:bg-secondary/40 transition-colors ${isSelected ? "bg-secondary/60" : ""}`}
+                                >
+                                  <div className="flex flex-col">
+                                    <span className="text-sm font-medium">{profile.email}</span>
+                                    {profile.nickname && (
+                                      <span className="text-xs text-muted-foreground">{profile.nickname}</span>
+                                    )}
+                                  </div>
+                                  <div
+                                    className={`w-4 h-4 rounded-sm border ${isSelected ? "bg-primary border-primary" : "border-border"}`}
+                                    aria-hidden
+                                  />
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </ScrollArea>
+                    </div>
+                    <div className="flex items-center justify-between text-xs text-muted-foreground">
+                      <span>Selected: {selectedUsers.length}</span>
+                      <span>Selected members are added on create</span>
+                    </div>
+                    <Button
+                      onClick={createProject}
+                      className="w-full bg-primary text-primary-foreground hover:bg-primary/90"
+                    >
+                      CREATE PROJECT
+                    </Button>
+                  </div>
+                </DialogContent>
+              </Dialog>
+            )}
+
           </div>
+
+          {selectedProject && (
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2 text-xs text-muted-foreground">
+              <span className="font-mono">Global: {profile?.role || "user"}</span>
+              <span className="hidden sm:block">•</span>
+              <span className="font-mono">Project: {projectRole}</span>
+            </div>
+          )}
 
           <div className="flex items-center gap-3">
             {selectedProject && assets.length > 0 && (
@@ -559,20 +742,20 @@ const Dashboard = () => {
           <div className="mt-6">
             <Tabs defaultValue="assets" className="w-full">
               <TabsList className="grid w-full max-w-md grid-cols-3 bg-secondary">
-                <TabsTrigger 
-                  value="assets" 
+                <TabsTrigger
+                  value="assets"
                   className="font-display text-xs tracking-wider data-[state=active]:bg-primary data-[state=active]:text-primary-foreground"
                 >
                   ASSETS
                 </TabsTrigger>
-                <TabsTrigger 
-                  value="overview" 
+                <TabsTrigger
+                  value="overview"
                   className="font-display text-xs tracking-wider data-[state=active]:bg-primary data-[state=active]:text-primary-foreground"
                 >
                   OVERVIEW
                 </TabsTrigger>
-                <TabsTrigger 
-                  value="logs" 
+                <TabsTrigger
+                  value="logs"
                   className="font-display text-xs tracking-wider data-[state=active]:bg-primary data-[state=active]:text-primary-foreground"
                 >
                   LOGS
